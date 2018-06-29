@@ -11,29 +11,17 @@ namespace Ray.RabbitMQ
         public int MaxPoolSize { get; set; }
         public string[] Hosts
         {
-            get
-            {
-                return hosts;
-            }
-            set
-            {
-                hosts = value;
-                if (hosts != null)
-                {
-                    list = new List<AmqpTcpEndpoint>();
-                    foreach (var host in hosts)
-                    {
-                        list.Add(AmqpTcpEndpoint.Parse(host));
-                    }
-                }
-            }
+            get;set;
         }
-        List<AmqpTcpEndpoint> list;
-        string[] hosts;
         public List<AmqpTcpEndpoint> EndPoints
         {
             get
             {
+                var list = new List<AmqpTcpEndpoint>();
+                foreach (var host in Hosts)
+                {
+                    list.Add(AmqpTcpEndpoint.Parse(host));
+                }
                 return list;
             }
         }

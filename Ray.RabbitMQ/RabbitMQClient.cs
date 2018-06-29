@@ -1,23 +1,18 @@
 ﻿using System;
 using System.Collections.Concurrent;
-using System.Collections.Generic;
 using System.Threading;
 using System.Threading.Tasks;
-using System.IO;
 using RabbitMQ.Client;
-using Newtonsoft.Json;
-using Ray.Core.Message;
-using Ray.RabbitMQ;
 using ProtoBuf;
-using Ray.Core;
 using Microsoft.Extensions.Options;
-using Microsoft.Extensions.DependencyInjection;
+using Ray.Core.Utils;
 
 namespace Ray.RabbitMQ
 {
     public class ConnectionWrapper
     {
         public IConnection Connection { get; set; }
+        public IRabbitMQClient Client { get; set; }
         int modelCount = 0;
         public int ModelCount { get { return modelCount; } }
         public int Increment()
@@ -35,34 +30,22 @@ namespace Ray.RabbitMQ
     }
     public class ModelWrapper : IDisposable
     {
+        IBasicProperties persistentProperties;
+        IBasicProperties noPersistentProperties;
+        public ModelWrapper(ConnectionWrapper connectionWrapper, IModel model)
+        {
+            Connection = connectionWrapper;
+            Model = model;
+            persistentProperties = this.Model.CreateBasicProperties();
+            persistentProperties.Persistent = true;
+            noPersistentProperties = this.Model.CreateBasicProperties();
+            noPersistentProperties.Persistent = false;
+        }
+        public ConnectionWrapper Connection { get; set; }
         public IModel Model { get; set; }
         public void Dispose()
         {
-            RabbitMQClient.PushModel(this);
-        }
-    }
-    public static class RabbitMQClient
-    {
-        static RabbitMQClient()
-        {
-            rabbitHost = Global.IocProvider.GetService<IOptions<RabbitConfig>>().Value;
-            _Factory = new ConnectionFactory()
-            {
-                UserName = rabbitHost.UserName,
-                Password = rabbitHost.Password,
-                VirtualHost = rabbitHost.VirtualHost,
-                AutomaticRecoveryEnabled = true
-            };
-        }
-        static ConnectionFactory _Factory;
-        static RabbitConfig rabbitHost;
-        public static async Task Send<T>(this RabbitPubAttribute rabbitMQInfo, T data, string key)
-        {
-            await Send(data, rabbitMQInfo.Exchange, rabbitMQInfo.GetQueue(key));
-        }
-        public static async Task SendCmd<T>(this RabbitPubAttribute rabbitMQInfo, UInt16 cmd, T data, string key)
-        {
-            await SendCmd<T>(cmd, data, rabbitMQInfo.Exchange, rabbitMQInfo.GetQueue(key));
+            Connection.Client.PushModel(this);
         }
         /// <summary>
         /// 发送消息到消息队列
@@ -72,61 +55,64 @@ namespace Ray.RabbitMQ
         /// <param name="exchange"></param>
         /// <param name="queue"></param>
         /// <returns></returns>
-        public static async Task Send<T>(T data, string exchange, string queue, bool persistent = true)
+        public void Publish<T>(T data, string exchange, string queue, bool persistent = true)
         {
-            byte[] msg;
-            using (var ms = new MemoryStream())
+            using (var ms = new PooledMemoryStream())
             {
                 Serializer.Serialize(ms, data);
-                msg = ms.ToArray();
+                Publish(ms.ToArray(), exchange, queue, persistent);
             }
-            await Send(msg, exchange, queue, persistent);
         }
-        public static async Task SendCmd<T>(UInt16 cmd, T data, string exchange, string queue)
+        public void PublishByCmd<T>(UInt16 cmd, T data, string exchange, string queue, bool persistent = false)
         {
-            byte[] msg;
-            using (var ms = new MemoryStream())
+            using (var ms = new PooledMemoryStream())
             {
                 ms.Write(BitConverter.GetBytes(cmd), 0, 2);
                 Serializer.Serialize(ms, data);
-                msg = ms.ToArray();
+                Publish(ms.ToArray(), exchange, queue, persistent);
             }
-            await Send(msg, exchange, queue, false);
         }
-        public static async Task Send(byte[] msg, string exchange, string queue, bool persistent = true)
+        public void Publish(byte[] msg, string exchange, string queue, bool persistent = true)
         {
-            using (var channel = await PullModel())
-            {
-                var prop = channel.Model.CreateBasicProperties();
-                prop.Persistent = persistent;
-                channel.Model.BasicPublish(exchange, queue, prop, msg);
-                channel.Model.WaitForConfirmsOrDie();
-            }
+            this.Model.BasicPublish(exchange, queue, persistent ? persistentProperties : noPersistentProperties, msg);
         }
-        public static async Task ExchangeDeclare(string exchange)
+    }
+    public class RabbitMQClient : IRabbitMQClient
+    {
+        ConnectionFactory _Factory;
+        RabbitConfig rabbitHost;
+        public RabbitMQClient(IOptions<RabbitConfig> config)
+        {
+            rabbitHost = config.Value;
+            _Factory = new ConnectionFactory
+            {
+                UserName = rabbitHost.UserName,
+                Password = rabbitHost.Password,
+                VirtualHost = rabbitHost.VirtualHost,
+                AutomaticRecoveryEnabled = true
+            };
+        }
+        public async Task ExchangeDeclare(string exchange)
         {
             using (var channel = await PullModel())
             {
                 channel.Model.ExchangeDeclare(exchange, "direct", true);
             }
         }
-        static ConcurrentQueue<ModelWrapper> modelPool = new ConcurrentQueue<ModelWrapper>();
-        static ConcurrentQueue<TaskCompletionSource<ModelWrapper>> modelTaskPool = new ConcurrentQueue<TaskCompletionSource<ModelWrapper>>();
-        static ConcurrentBag<ConnectionWrapper> connectionList = new ConcurrentBag<ConnectionWrapper>();
-        static int connectionCount = 0;
-        static object modelLock = new object();
-        public static IConnection CreateConnection()
-        {
-            return _Factory.CreateConnection(rabbitHost.EndPoints);
-        }
-        public static async Task<ModelWrapper> PullModel()
+        ConcurrentQueue<ModelWrapper> modelPool = new ConcurrentQueue<ModelWrapper>();
+        ConcurrentBag<ModelWrapper> modelList = new ConcurrentBag<ModelWrapper>();
+        ConcurrentQueue<TaskCompletionSource<ModelWrapper>> modelTaskPool = new ConcurrentQueue<TaskCompletionSource<ModelWrapper>>();
+        ConcurrentBag<ConnectionWrapper> connectionList = new ConcurrentBag<ConnectionWrapper>();
+        int connectionCount = 0;
+        readonly object modelLock = new object();
+        public async Task<ModelWrapper> PullModel()
         {
             if (!modelPool.TryDequeue(out var model))
             {
                 ConnectionWrapper conn = null;
                 foreach (var item in connectionList)
                 {
-                    if (item.Increment() <= 10)
+                    if (item.Increment() <= 16)
                     {
                         conn = item;
                         break;
@@ -138,18 +124,26 @@ namespace Ray.RabbitMQ
                 }
                 if (conn == null && Interlocked.Increment(ref connectionCount) <= rabbitHost.MaxPoolSize)
                 {
-                    conn = new ConnectionWrapper() { Connection = _Factory.CreateConnection(rabbitHost.EndPoints) };
-                    conn.Connection.ConnectionShutdown += (obj, args) =>
+                    Task.Run(() =>
                     {
-                        conn.Connection = _Factory.CreateConnection(rabbitHost.EndPoints);
-                        conn.Reset();
-                    };
-                    connectionList.Add(conn);
+                        conn = new ConnectionWrapper
+                        {
+                            Client = this,
+                            Connection = _Factory.CreateConnection(rabbitHost.EndPoints)
+                        };
+                        conn.Connection.ConnectionShutdown += (obj, args) =>
+                        {
+                            conn.Connection = _Factory.CreateConnection(rabbitHost.EndPoints);
+                            conn.Reset();
+                        };
+                        connectionList.Add(conn);
+                    }).GetAwaiter().GetResult();
                 }
                 if (conn != null)
                 {
-                    model = new ModelWrapper() { Model = conn.Connection.CreateModel() };
+                    model = new ModelWrapper(conn, conn.Connection.CreateModel());
                     model.Model.ConfirmSelect();
+                    modelList.Add(model);
                 }
                 else
                 {
@@ -164,22 +158,22 @@ namespace Ray.RabbitMQ
                 var cancelSource = new CancellationTokenSource(3000);
                 cancelSource.Token.Register(() =>
                 {
-                    taskSource.SetException(new Exception("获取rabbitmq的model超时"));
+                    taskSource.SetException(new Exception("get rabbitmq's model timeout"));
                 });
                 model = await taskSource.Task;
             }
             if (model.Model.IsClosed)
             {
+                model.Connection.Decrement();
                 model = await PullModel();
             }
             return model;
         }
-        public static void PushModel(ModelWrapper model)
+        public void PushModel(ModelWrapper model)
         {
             if (model.Model.IsOpen)
             {
-                TaskCompletionSource<ModelWrapper> modelTask;
-                if (modelTaskPool.TryDequeue(out modelTask))
+                if (modelTaskPool.Count > 0 && modelTaskPool.TryDequeue(out var modelTask))
                 {
                     if (modelTask.Task.IsCanceled)
                         PushModel(model);
@@ -191,6 +185,15 @@ namespace Ray.RabbitMQ
             else
             {
                 model.Model.Dispose();
+                model.Connection.Decrement();
+            }
+        }
+
+        public void Dispose()
+        {
+            foreach (var model in modelList)
+            {
+                model.Model.WaitForConfirmsOrDie();
             }
         }
     }

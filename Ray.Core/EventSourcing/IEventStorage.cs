@@ -6,9 +6,8 @@ namespace Ray.Core.EventSourcing
 {
     public interface IEventStorage<K>
     {
-        Task<List<EventInfo<K>>> GetListAsync(K stateId, UInt32 startVersion, UInt32 endVersion, DateTime? startTime = null);
-        Task<List<EventInfo<K>>> GetListAsync(K stateId, string typeCode, UInt32 startVersion, UInt32 endVersion, DateTime? startTime = null);
-        Task<bool> InsertAsync<T>(T data,byte[] bytes, string uniqueId = null, bool needComplate = true) where T : IEventBase<K>;
-        Task Complete<T>(T data) where T : IEventBase<K>;
+        Task<IList<IEventBase<K>>> GetListAsync(K stateId, Int64 startVersion, Int64 endVersion, DateTime? startTime = null);
+        Task<IList<IEventBase<K>>> GetListAsync(K stateId, string typeCode, Int64 startVersion, Int32 limit, DateTime? startTime = null);
+        Task<bool> SaveAsync(IEventBase<K> data, byte[] bytes, string uniqueId = null);
     }
 }

@@ -1,38 +1,93 @@
 ﻿using System;
 using System.Collections.Generic;
-using Ray.Core.Lib;
+using System.Collections.Concurrent;
+using Ray.Core.Utils;
 
 namespace Ray.RabbitMQ
 {
     [AttributeUsage(AttributeTargets.Class)]
     public class RabbitPubAttribute : Attribute
     {
-        public RabbitPubAttribute(string exchange = null, string queue = null, int queueCount = 1)
+        public RabbitPubAttribute(string exchange = null, string queue = null, int queueCount = 1, bool cacheHashKey = false)
         {
-            this.Exchange = exchange;
-            this.Queue = queue;
-            this.QueueCount = queueCount;
+            Exchange = exchange;
+            Queue = queue;
+            QueueCount = queueCount;
+            CacheHashKey = cacheHashKey;
         }
         ConsistentHash _CHash;
-        List<string> nodeList = new List<string>();
-        public void Init()
+        public IRabbitMQClient Client { get; set; }
+        public bool CacheHashKey { get; set; }
+        List<string> nodeList;
+        Dictionary<string, ModelWrapper> models = new Dictionary<string, ModelWrapper>();
+        public void Init(IRabbitMQClient client)
         {
-            for (int i = 0; i < QueueCount; i++)
+            var isOnce = QueueCount == 1;
+            if (isOnce)
             {
-                nodeList.Add(Queue + "_" + i);
+                models.Add(Queue, client.PullModel().GetAwaiter().GetResult());
             }
-            _CHash = new ConsistentHash(nodeList, QueueCount * 10);
+            else
+            {
+                nodeList = new List<string>();
+                for (int i = 0; i < QueueCount; i++)
+                {
+                    var queue = $"{ Queue}_{i}";
+                    nodeList.Add(queue);
+                    models.Add(queue, client.PullModel().GetAwaiter().GetResult());
+                }
+                _CHash = new ConsistentHash(nodeList, QueueCount * 10);
+            }
             //申明exchange
-            RabbitMQClient.ExchangeDeclare(this.Exchange).Wait();
+            client.ExchangeDeclare(Exchange).Wait();
+            Client = client;
         }
-        public string GetQueue(string key)
+        ConcurrentDictionary<string, (string queue, ModelWrapper model)> queueDict = new ConcurrentDictionary<string, (string queue, ModelWrapper model)>();
+        public (string queue, ModelWrapper model) GetQueue(string key)
         {
-            if (QueueCount == 1) return Queue;
-
-            return _CHash.GetNode(key);
+            if (CacheHashKey)
+            {
+                if (!queueDict.TryGetValue(key, out var result))
+                {
+                    var queue = QueueCount == 1 ? Queue : _CHash.GetNode(key);
+                    result = (queue, models[queue]);
+                    queueDict.TryAdd(key, result);
+                }
+                if (result.model.Model.IsClosed)
+                {
+                    result.model.Dispose();
+                    result.model = models[result.queue] = Client.PullModel().GetAwaiter().GetResult();
+                }
+                return result;
+            }
+            else
+            {
+                var queue = QueueCount == 1 ? Queue : _CHash.GetNode(key);
+                var model = models[queue];
+                if (model.Model.IsClosed)
+                {
+                    model.Dispose();
+                    model = models[queue] = Client.PullModel().GetAwaiter().GetResult();
+                }
+                return (queue, model);
+            }
         }
+
         public string Exchange { get; set; }
         public string Queue { get; set; }
         public int QueueCount { get; set; }
+    }
+    public static class RabbitPubAttrExtensions
+    {
+        public static void Publish(this RabbitPubAttribute rabbitMQInfo, byte[] bytes, string key, bool persistent = true)
+        {
+            var (queue, model) = rabbitMQInfo.GetQueue(key);
+            model.Publish(bytes, rabbitMQInfo.Exchange, queue, persistent);
+        }
+        public static void PublishByCmd<T>(this RabbitPubAttribute rabbitMQInfo, UInt16 cmd, T data, string key, bool persistent = true)
+        {
+            var (queue, model) = rabbitMQInfo.GetQueue(key);
+            model.PublishByCmd<T>(cmd, data, rabbitMQInfo.Exchange, queue, persistent);
+        }
     }
 }

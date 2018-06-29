@@ -1,47 +1,56 @@
 ﻿using System;
 using System.Collections.Concurrent;
+using Orleans;
 using Ray.Core;
 using Ray.Core.MQ;
 
 namespace Ray.RabbitMQ
 {
     public class MQServiceContainer<W> : IMQServiceContainer
-        where W : MessageWrapper, new()
+        where W : IMessageWrapper, new()
     {
-        ConcurrentDictionary<Type, IMQService> typeMQDict = new ConcurrentDictionary<Type, IMQService>();
-        public IMQService GetService(Type type)
+        readonly IRabbitMQClient client;
+        public MQServiceContainer(IRabbitMQClient client)
         {
-            if (!typeMQDict.TryGetValue(type, out var value))
+            this.client = client;
+        }
+        ConcurrentDictionary<Type, IMQService> serviceDict = new ConcurrentDictionary<Type, IMQService>();
+        readonly object typeLock = new object();
+        public IMQService GetService(Type type, Grain grain)
+        {
+            if (!serviceDict.TryGetValue(type, out var value))
             {
-                var mqPubAttr = GetRabbitMQAttr(type);
-                value = new RabbitMQService<W>(mqPubAttr);
-                typeMQDict.TryAdd(type, value);
+                lock (typeLock)
+                {
+                    value = new RabbitMQService(GetAttribute(type));
+                    serviceDict.TryAdd(type, value);
+                }
             }
             return value;
         }
-        static Type rabbitMQType = typeof(RabbitPubAttribute);
-        public static RabbitPubAttribute GetRabbitMQAttr(Type type)
+        static readonly Type rabbitMQType = typeof(RabbitPubAttribute);
+        public RabbitPubAttribute GetAttribute(Type type)
         {
             var rabbitMQAttributes = type.GetCustomAttributes(rabbitMQType, true);
-            RabbitPubAttribute mqAttr = null;
+            RabbitPubAttribute pubAttribute = null;
             if (rabbitMQAttributes.Length > 0)
             {
-                mqAttr = rabbitMQAttributes[0] as RabbitPubAttribute;
-                if (string.IsNullOrEmpty(mqAttr.Exchange))
+                pubAttribute = rabbitMQAttributes[0] as RabbitPubAttribute;
+                if (string.IsNullOrEmpty(pubAttribute.Exchange))
                 {
-                    mqAttr.Exchange = type.Namespace;
+                    pubAttribute.Exchange = type.Namespace;
                 }
-                if (string.IsNullOrEmpty(mqAttr.Queue))
+                if (string.IsNullOrEmpty(pubAttribute.Queue))
                 {
-                    mqAttr.Queue = type.Name;
+                    pubAttribute.Queue = type.Name;
                 }
             }
-            if (mqAttr == null)
+            if (pubAttribute == null)
             {
-                mqAttr = new RabbitPubAttribute(type.Namespace, type.Name);
+                pubAttribute = new RabbitPubAttribute(type.Namespace, type.Name);
             }
-            mqAttr.Init();
-            return mqAttr;
+            pubAttribute.Init(client);
+            return pubAttribute;
         }
     }
 }

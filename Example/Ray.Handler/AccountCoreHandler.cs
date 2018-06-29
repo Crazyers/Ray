@@ -1,27 +1,27 @@
-﻿using Ray.Core.MQ;
+﻿using Ray.Core;
+using Ray.Core.EventSourcing;
+using Ray.Core.MQ;
 using Ray.IGrains;
 using Ray.IGrains.Actors;
-using Ray.IGrains.Events;
 using Ray.RabbitMQ;
+using System;
 using System.Threading.Tasks;
 
 namespace Ray.Handler
 {
     [RabbitSub("Core", "Account", "account")]
-    public class AccountCoreHandler : PartSubHandler<MessageInfo>
+    public sealed class AccountCoreHandler : MultHandler<long, MessageInfo>
     {
-        public AccountCoreHandler()
+        IClientFactory clientFactory;
+        public AccountCoreHandler(IServiceProvider svProvider, IClientFactory clientFactory) : base(svProvider)
         {
-            Register<AmountTransferEvent>(AmountAddEventHandler);
+            this.clientFactory = clientFactory;
         }
-        public Task AmountAddEventHandler(MessageInfo msg, object evt)
+
+        protected override Task SendToAsyncGrain(byte[] bytes, IEventBase<long> evt)
         {
-            if (evt is AmountTransferEvent value)
-            {
-                var toActor = HandlerStart.Client.GetGrain<IAccount>(value.ToAccountId);
-                return toActor.AddAmount(value.Amount, value.Id);
-            }
-            return Task.CompletedTask;
+            var client = clientFactory.CreateClient();
+            return client.GetGrain<IAccountFlow>(evt.StateId).Tell(bytes);
         }
     }
 }

@@ -5,6 +5,10 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <PackageReference Include="Npgsql" Version="4.0.0" />
+  </ItemGroup>
+
+  <ItemGroup>
     <ProjectReference Include="..\..\Ray.Core\Ray.Core.csproj" />
     <ProjectReference Include="..\..\Ray.RabbitMQ\Ray.RabbitMQ.csproj" />
     <ProjectReference Include="..\Ray.IGrains\Ray.IGrains.csproj" />
